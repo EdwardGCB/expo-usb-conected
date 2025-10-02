@@ -1,0 +1,122 @@
+@startuml Abbott FreeStyle Neo - Protocolo HID Detallado
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequence {
+  BackgroundColor #E8F4FD
+  BorderColor #2E86AB
+  FontColor #000000
+}
+skinparam participant {
+  BackgroundColor #F8F9FA
+  BorderColor #6C757D
+}
+
+title Abbott FreeStyle Neo - Protocolo HID y Comunicación
+
+participant "Usuario" as User
+participant "UI (Upload.js)" as UI
+participant "Actions (async.js)" as Actions
+participant "Device Manager" as DeviceMgr
+participant "HID Device" as HID
+participant "FreeStyle Protocol" as Protocol
+participant "PrecisionNeo Driver" as Driver
+participant "Tidepool API" as API
+
+User -> UI: Clic en botón "Subir"
+UI -> Actions: handleUpload()
+Actions -> Actions: doDeviceUpload(driverId, opts)
+
+Actions -> DeviceMgr: device.detect(driverId, opts)
+DeviceMgr -> DeviceMgr: Buscar en deviceInfoCache
+DeviceMgr -> HID: hidDevice.connect(deviceInfo)
+
+note over HID: Web HID API
+HID -> HID: webHid.open()
+HID -> HID: addEventListener('inputreport')
+HID --> DeviceMgr: Conexión establecida
+
+DeviceMgr -> Protocol: protocol.initCommunication()
+
+note over Protocol: Secuencia de inicialización
+Protocol -> HID: sendCommand(0x04, null, '')
+HID --> Protocol: Respuesta
+Protocol -> HID: sendAck('\x00\x02')
+HID --> Protocol: ACK
+Protocol -> HID: sendCommand(0x05, null, '')
+HID --> Protocol: Respuesta
+Protocol -> HID: sendCommand(0x15, null, '')
+HID --> Protocol: Respuesta
+Protocol -> HID: sendCommand(0x01, null, '')
+HID --> Protocol: Respuesta
+
+Protocol --> DeviceMgr: Inicialización completa
+
+DeviceMgr -> Driver: getConfigInfo()
+
+Driver -> Protocol: requestTextResponse('$serlnum?')
+Protocol -> HID: sendCommand(0x21, '$serlnum?')
+note over HID: Comando de texto HID
+HID --> Protocol: Respuesta con número de serie
+Protocol --> Driver: Número de serie
+
+Driver -> Protocol: requestTextResponse('$date?')
+Protocol -> HID: sendCommand(0x21, '$date?')
+HID --> Protocol: Fecha del dispositivo
+Protocol --> Driver: Fecha
+
+Driver -> Protocol: requestTextResponse('$time?')
+Protocol -> HID: sendCommand(0x21, '$time?')
+HID --> Protocol: Hora del dispositivo
+Protocol --> Driver: Hora
+
+Driver -> Driver: Verificar sincronización de tiempo
+alt Hora incorrecta
+  Driver -> Protocol: requestTextResponse('$time,HH,mm')
+  Driver -> Protocol: requestTextResponse('$date,MM,DD,YY')
+  note over Protocol: Actualizar hora del dispositivo
+end
+
+Driver --> DeviceMgr: Configuración completa
+
+DeviceMgr -> Driver: fetchData()
+
+Driver -> Protocol: getDBRecords('$result?')
+Protocol -> HID: sendCommand(0x21, '$result?')
+note over HID: Obtener todos los registros
+HID --> Protocol: Datos de la base de datos
+Protocol --> Driver: Registros completos
+
+Driver --> DeviceMgr: Datos obtenidos
+
+DeviceMgr -> Driver: processData()
+
+note over Driver: Procesamiento de datos
+Driver -> Driver: buildTimeChangeRecords()
+note right: Filtrar tipo 6 (TIME_CHANGE)
+
+Driver -> Driver: buildBGRecords()
+note right: Filtrar tipo 7 (GLUCOSE)\nManejar HI/LO\nExcluir controles
+
+Driver -> Driver: buildKetoneRecords()
+note right: Filtrar tipo 9 (KETONE)\nManejar HI\nFactor 18.0
+
+Driver -> Driver: Convertir a formato Tidepool
+Driver --> DeviceMgr: Datos procesados
+
+DeviceMgr -> Driver: uploadData()
+
+Driver -> API: cfg.api.upload.toPlatform()
+note over API: Subir a Tidepool
+API --> Driver: Resultado de subida
+
+Driver --> DeviceMgr: Subida completa
+
+DeviceMgr -> HID: disconnect()
+HID -> HID: webHid.close()
+HID -> HID: removeEventListener()
+
+DeviceMgr --> Actions: Proceso completado
+Actions --> UI: Mostrar resultado
+UI --> User: Éxito o error
+
+@enduml

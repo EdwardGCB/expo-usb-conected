@@ -1,12 +1,29 @@
-import { NativeModule, requireNativeModule } from 'expo';
+import { requireNativeModule } from "expo-modules-core";
 
-import { ExpoUsbConectedModuleEvents } from './ExpoUsbConected.types';
-
-declare class ExpoUsbConectedModule extends NativeModule<ExpoUsbConectedModuleEvents> {
-  PI: number;
-  hello(): string;
-  setValueAsync(value: string): Promise<void>;
+// Interfaz para definir la estructura de un dispositivo USB
+export interface UsbDevice {
+  deviceName: string;
+  vendorId: number;
+  productId: number;
+  manufacturerName?: string;
+  productName?: string;
+  serialNumber?: string;
+  hasPermission: boolean;
 }
 
-// This call loads the native module object from the JSI.
-export default requireNativeModule<ExpoUsbConectedModule>('ExpoUsbConected');
+// Interfaz del módulo nativo actualizada con todas las funciones necesarias
+export interface ExpoUsbModule {
+  scanDevices(): Promise<UsbDevice[]>;
+  requestPermission(deviceName: string): Promise<boolean>;
+  setAutoRequestPermissions(enabled: boolean): Promise<void>;
+  openDevice(deviceName: string): Promise<boolean>;
+  closeDevice(deviceName: string): Promise<boolean>;
+  claimInterface(deviceName: string, interfaceNumber: number): Promise<boolean>;
+  releaseInterface(deviceName: string, interfaceNumber: number): Promise<boolean>;
+  writeData(deviceName: string, data: number[]): Promise<number>;
+  readData(deviceName: string, timeout?: number): Promise<number[]>;
+  sendTextCommand(deviceName: string, command: string): Promise<string>;
+}
+
+// Exportar el módulo nativo tipado
+export default requireNativeModule<ExpoUsbModule>("ExpoUsbConected");

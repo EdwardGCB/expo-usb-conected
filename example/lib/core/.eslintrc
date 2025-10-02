@@ -1,0 +1,28 @@
+{
+  "extends": "airbnb",
+  "plugins": ["lodash"],
+  "parserOptions": {
+    "ecmaVersion": 6
+  },
+  "rules": {
+    "max-len": "warn",
+    "import/order": "warn",
+    "no-plusplus": [
+      "error",
+      {
+        "allowForLoopAfterthoughts": true
+      }
+    ],
+    "lodash/prefer-lodash-method": "off",
+    "arrow-parens": "warn",
+    "operator-linebreak": "warn",
+    "no-else-return": "warn",
+    "object-curly-newline": "warn",
+    "linebreak-style": 0,
+    "implicit-arrow-linebreak": "warn"
+  },
+  "settings": {
+    "lodash": 3,
+    "import/resolver": node
+  }
+}

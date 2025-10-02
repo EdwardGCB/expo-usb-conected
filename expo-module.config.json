@@ -5,5 +5,8 @@
   },
   "android": {
     "modules": ["expo.modules.usbconected.ExpoUsbConectedModule"]
+  },
+  "web": {
+    "modules": ["ExpoUsbConectedModule"]
   }
 }

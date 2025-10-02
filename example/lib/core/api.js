@@ -1,0 +1,931 @@
+/* eslint-disable no-param-reassign */
+/**
+ * Copyright (c) 2014, Tidepool Project
+ *
+ * This program is free software; you can redistribute it and/or modify it under
+ * the terms of the associated License, which is identical to the BSD 2-Clause
+ * License as published by the Open Source Initiative at opensource.org.
+ *
+ * This program is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+ * FOR A PARTICULAR PURPOSE. See the License for more details.
+ *
+ * You should have received a copy of the License along with this program; if
+ * not, you can obtain one from Tidepool Project at tidepool.org.
+ */
+
+import _ from 'lodash';
+import async from 'async';
+import { format } from 'util';
+import sundial from 'sundial';
+import { v4 as uuidv4 } from 'uuid';
+import os from 'os';
+import bows from 'bows';
+// Wrapper around the Tidepool client library
+import createTidepoolClient from 'tidepool-platform-client';
+
+import ErrorMessages from '../../app/constants/errorMessages';
+import builder from '../objectBuilder';
+import localStore from './localStore';
+import rollbar from '../../app/utils/rollbar';
+import * as actionUtils from '../../app/actions/utils';
+import personUtils from './personUtils';
+import env from '../../app/utils/env';
+
+if (env.node && !env.electron && typeof globalThis.crypto === 'undefined') {
+  const { subtle } = require('crypto').webcrypto; // eslint-disable-line global-require
+  globalThis.crypto = {
+    subtle,
+  };
+}
+
+// eslint-disable-next-line no-console
+const log = env.electron ? bows('Api') : console.log;
+
+// for cli tools running in node
+if (typeof localStore === 'function') {
+  localStore = localStore({});
+}
+
+let tidepool;
+
+const api = {
+  log,
+};
+
+// ----- Api Setup -----
+
+// synchronous!
+api.create = (options) => {
+  // eslint-disable-next-line no-console
+  const tidepoolLog = env.node ? console.log : bows('Tidepool');
+  tidepool = createTidepoolClient({
+    host: options.apiUrl,
+    uploadApi: options.uploadUrl,
+    dataHost: options.dataUrl,
+    log: {
+      warn: tidepoolLog,
+      info: tidepoolLog,
+      debug: tidepoolLog,
+    },
+    localStore,
+    metricsSource: 'uploader',
+    metricsVersion: options.version,
+    sessionTrace: uuidv4(),
+  });
+
+  api.tidepool = tidepool;
+};
+
+// asynchronous!
+api.init = (cb) => {
+  api.tidepool.initialize(cb);
+};
+
+// ----- Config -----
+api.setHosts = (hosts) => {
+  if (hosts.API_URL) {
+    tidepool.setApiHost(hosts.API_URL);
+  }
+  if (hosts.UPLOAD_URL) {
+    tidepool.setUploadHost(hosts.UPLOAD_URL);
+  }
+  if (hosts.DATA_URL) {
+    tidepool.setDataHost(hosts.DATA_URL);
+  }
+  if (hosts.BLIP_URL) {
+    tidepool.setBlipHost(hosts.BLIP_URL);
+  }
+
+  if (rollbar && rollbar.configure) {
+    rollbar.configure({
+      payload: {
+        environment: hosts.environment,
+      },
+    });
+  }
+};
+
+api.makeBlipUrl = (tail) => tidepool.makeBlipUrl(tail);
+
+// ----- User -----
+
+api.user = {};
+
+api.user.initializationInfo = (cb) => {
+  const userId = tidepool.getUserId();
+  async.series([
+    api.user.account,
+    api.user.loggedInProfile,
+    api.user.getUploadGroups,
+    api.user.getAssociatedAccounts,
+    (callback) => { api.clinics.getClinicsForClinician(userId, { limit: 1000, offset: 0 }, callback); },
+  ], cb);
+};
+
+api.user.login = (user, options, cb) => {
+  api.log('POST /auth/login');
+
+  if (!tidepool.isLoggedIn()) {
+    tidepool.login(user, options, (err, data) => {
+      if (err) {
+        return cb(err);
+      }
+      if (rollbar && rollbar.configure) {
+        rollbar.configure({
+          payload: {
+            person: {
+              id: data.userid,
+              email: user.username,
+              username: user.username,
+            },
+          },
+        });
+      }
+      return cb(null, data);
+    });
+  } else {
+    api.user.account((err, acctUser) => {
+      cb(err, { user: acctUser });
+    });
+  }
+};
+
+api.user.loginExtended = (user, options, cb) => {
+  async.series([
+    api.user.login.bind(null, user, options),
+    api.user.loggedInProfile,
+    api.user.getUploadGroups,
+    api.user.getAssociatedAccounts,
+  ], cb);
+};
+
+api.user.saveSession = (userId, token, options, cb) => {
+  options = options || {};
+  if (typeof options === 'function') {
+    cb = options;
+    options = {};
+  }
+  if (_.isUndefined(cb)) {
+    cb = _.noop;
+  }
+  tidepool.saveSession(userId, token, options, (err) => {
+    if (err) {
+      return cb(err);
+    }
+    return cb();
+  });
+};
+
+api.user.account = (cb) => {
+  api.log('GET /auth/user');
+  tidepool.getCurrentUser((err, user) => {
+    // the rewire plugin messes with default export in tests
+    if (rollbar && rollbar.configure) {
+      rollbar.configure({
+        payload: {
+          person: {
+            id: user.userid,
+            email: user.username,
+            username: user.username,
+          },
+        },
+      });
+    }
+    cb(err, user);
+  });
+};
+
+api.user.loggedInProfile = (cb) => {
+  api.log(`GET /metadata/${tidepool.getUserId()}/profile`);
+  tidepool.findProfile(tidepool.getUserId(), (err, profile) => {
+    if (err) {
+      return cb(err);
+    }
+    return cb(null, profile);
+  });
+};
+
+api.user.profile = (userId, cb) => {
+  api.log(`GET /metadata/${userId}/profile`);
+  tidepool.findProfile(userId, (err, profile) => {
+    if (err) {
+      return cb(err);
+    }
+    return cb(null, profile);
+  });
+};
+
+api.user.addProfile = (userId, profile, cb) => {
+  api.log(`PUT /metadata/${userId}/profile`);
+  tidepool.addOrUpdateProfile(userId, profile, (err, response) => {
+    if (err) {
+      return cb(err);
+    }
+    return cb(null, response);
+  });
+};
+
+api.user.updateProfile = (userId, updates, cb) => {
+  api.user.profile(userId, (err, profile) => {
+    if (err) {
+      return cb(err);
+    }
+    const currentEmail = _.get(profile, 'emails[0]');
+    const newProfile = actionUtils.mergeProfileUpdates(profile, updates);
+    const emails = _.get(updates, 'emails');
+    // check to see if we have a single email address that also needs to be updated
+    if (_.isArray(emails) && emails.length === 1 && emails[0] !== currentEmail) {
+      return async.series([
+        (callback) => tidepool.updateCustodialUser({
+          username: emails[0],
+          emails,
+        }, userId, callback),
+        (callback) => tidepool.addOrUpdateProfile(userId, newProfile, callback),
+        (callback) => tidepool.signupStart(userId, callback),
+      ], (error, results) => {
+        if (error) {
+          return cb(error);
+        }
+        return cb(null, results[1]);
+      });
+    }
+    return tidepool.addOrUpdateProfile(userId, newProfile, cb);
+  });
+};
+
+api.user.logout = (cb) => {
+  api.log('POST /auth/logout');
+  if (!tidepool.isLoggedIn()) {
+    api.log('Not authenticated, but still destroying session for just in cases...');
+    tidepool.destroySession();
+    return;
+  }
+  tidepool.logout((err) => {
+    if (err) {
+      api.log('Error while logging out but still destroying session...');
+      tidepool.destroySession();
+      return cb(err);
+    }
+    return cb(null);
+  });
+};
+
+api.user.getUploadGroups = (cb) => {
+  const userId = tidepool.getUserId();
+
+  api.log(`GET /metadata/users/${userId}`);
+
+  async.parallel([
+    (callback) => tidepool.getAssociatedUsersDetails(userId, callback),
+    (callback) => tidepool.findProfile(userId, callback),
+  ], (err, results) => {
+    if (err) {
+      cb(err);
+    }
+    const [users, profile] = results;
+
+    let uploadUsers = _.filter(users, (user) => _.has(user.trustorPermissions, 'upload'));
+
+    uploadUsers = _.map(uploadUsers, (user) => {
+      // eslint-disable-next-line no-param-reassign
+      user.permissions = user.trustorPermissions;
+      // eslint-disable-next-line no-param-reassign
+      delete user.trustorPermissions;
+      return user;
+    });
+
+    // getAssociatedUsersDetails doesn't include the current user
+    uploadUsers.push({
+      userid: userId,
+      profile,
+      permissions: { root: {} },
+    });
+
+    const sortedUsers = _.sortBy(uploadUsers, (group) => group.userid === userId);
+    return cb(null, sortedUsers);
+  });
+};
+
+api.user.createCustodialAccount = (profile, cb) => {
+  const userId = tidepool.getUserId();
+
+  api.log(`POST /auth/user/${userId}/user`);
+  tidepool.createCustodialAccount(profile, (err, account) => cb(err, account));
+};
+
+// Get all accounts associated with the current user
+api.user.getAssociatedAccounts = (cb) => {
+  api.log('GET /patients');
+
+  tidepool.getAssociatedUsersDetails(tidepool.getUserId(), (err, users) => {
+    if (err) {
+      return cb(err);
+    }
+
+    // Filter out viewable users, data donation, and care team accounts separately
+    const viewableUsers = [];
+    const dataDonationAccounts = [];
+    const careTeam = [];
+
+    _.each(users, (user) => {
+      if (personUtils.isDataDonationAccount(user)) {
+        dataDonationAccounts.push({
+          userid: user.userid,
+          email: user.username,
+          status: 'confirmed',
+        });
+      } else if (!_.isEmpty(user.trustorPermissions)) {
+        // These are the accounts that have shared their data
+        // with a given set of permissions.
+        user.permissions = user.trustorPermissions;
+        delete user.trustorPermissions;
+        viewableUsers.push(user);
+      } else if (!_.isEmpty(user.trusteePermissions)) {
+        // These are accounts with which the user has shared access to their data, exluding the
+        // data donation accounts
+        user.permissions = user.trusteePermissions;
+        delete user.trusteePermissions;
+        careTeam.push(user);
+      }
+    });
+
+    return cb(null, {
+      patients: viewableUsers,
+      dataDonationAccounts,
+      careTeam,
+    });
+  });
+};
+
+// ----- Patient -----
+
+api.patient = {};
+
+// Get a user's public info
+function getPerson(userId, cb) {
+  const person = { userid: userId };
+
+  tidepool.findProfile(userId, (err, profile) => {
+    if (err) {
+      // Due to existing account creation anti-patterns, coupled with automatically sharing our demo
+      // account with new VCAs, we can end up with 404s that break login of our demo user when any
+      // VCA account has not completed their profile setup. Until this is addressed on the backend,
+      // we can't callback an error for 404s.
+      if (err.status === 404) {
+        person.profile = null;
+        return cb(null, person);
+      }
+      return cb(err);
+    }
+
+    person.profile = profile;
+    return cb(null, person);
+  });
+}
+
+function setPatientSettings(person, cb) {
+  api.metadata.settings.get(person.userid, (err, settings) => {
+    if (err) {
+      return cb(err);
+    }
+
+    person.settings = settings || {};
+
+    return cb(null, person);
+  });
+}
+
+/*
+ * Not every user is a "patient".
+ * Get the "patient" and attach the logged in users permissons
+ */
+function getPatient(patientId, cb) {
+  return getPerson(patientId, (err, person) => {
+    if (err) {
+      return cb(err);
+    }
+
+    if (!personUtils.isPatient(person)) {
+      return cb();
+    }
+
+    // Attach the settings for the patient
+    return setPatientSettings(person, cb);
+  });
+}
+
+api.patient.get = function (patientId, cb) {
+  api.log(`GET /patients/${patientId}`);
+
+  getPatient(patientId, (err, patient) => {
+    if (err) {
+      return cb(err);
+    }
+
+    if (!patient) {
+      // No patient profile for this user yet, return "not found"
+      return cb({ status: 404, response: 'Not found' });
+    }
+
+    return cb(null, patient);
+  });
+};
+
+// ----- Metadata -----
+
+api.metadata = {};
+
+api.metadata.settings = {};
+
+api.metadata.settings.get = function (patientId, cb) {
+  api.log(`GET /metadata/${patientId}/settings`);
+
+  // We don't want to fire an error if the patient has no settings saved yet,
+  // so we check if the error status is not 404 first.
+  tidepool.findSettings(patientId, (err, payload) => {
+    if (err && err.status !== 404) {
+      return cb(err);
+    }
+
+    const settings = payload || {};
+
+    return cb(null, settings);
+  });
+};
+
+// ----- Upload -----
+
+api.upload = {};
+
+api.upload.getInfo = (cb) => {
+  api.log('GET /info');
+  tidepool.checkUploadVersions((err, resp) => {
+    if (err) {
+      if (!navigator.onLine) {
+        const error = new Error(ErrorMessages.E_OFFLINE);
+        error.originalError = err;
+        return cb(error);
+      }
+      return cb(err);
+    }
+    return cb(null, resp);
+  });
+};
+
+api.upload.getVersions = (cb) => {
+  api.log('GET /info');
+  tidepool.checkUploadVersions((err, resp) => {
+    if (err) {
+      if (!navigator.onLine) {
+        const error = new Error(ErrorMessages.E_OFFLINE);
+        error.originalError = err;
+        return cb(error);
+      }
+      return cb(err);
+    }
+    const uploaderVersion = _.get(resp, ['versions', 'uploaderMinimum'], null);
+    if (uploaderVersion !== null) {
+      return cb(null, resp.versions);
+    }
+    return cb(new Error(format('Info response does not contain versions.uploaderMinimum.')));
+  });
+};
+
+api.upload.accounts = (happyCb, sadCb) => {
+  api.log(`GET /access/groups/${tidepool.getUserId()}`);
+  tidepool.getViewableUsers(tidepool.getUserId(), (err, data) => {
+    if (err) {
+      return sadCb(err, err);
+    }
+    return happyCb(data, 'upload accounts found');
+  });
+};
+
+function getUploadFunction(uploadType) {
+  if (uploadType === 'dataservices') {
+    return tidepool.addDataToDataset;
+  }
+
+  if (uploadType === 'jellyfish') {
+    return tidepool.uploadDeviceDataForUser;
+  }
+  return null;
+}
+
+function buildError(error, datasetId) {
+  const err = new Error('Uploading data to platform failed.');
+  err.name = 'API Error';
+  err.status = error.status;
+  err.datasetId = datasetId;
+  if (error.meta && error.meta.trace) {
+    err.requestTrace = error.meta.trace.request;
+    err.sessionTrace = error.meta.trace.session;
+  }
+
+  api.log(JSON.stringify(_.omit(error, 'sessionToken'), null, '\t'));
+
+  return err;
+}
+
+function createDatasetForUser(userId, info, callback) {
+  const happy = (dataset) => callback(null, dataset);
+
+  const sad = (err) => {
+    api.log('platform create dataset failed:', err);
+    const error = buildError(err);
+    callback(error);
+  };
+
+  api.log('createDataset for user id ', userId, info);
+
+  // eslint-disable-next-line no-param-reassign
+  info.deduplicator = {
+    name: 'org.tidepool.deduplicator.device.deactivate.hash',
+  };
+
+  tidepool.createDatasetForUser(userId, info, (err, dataset) => {
+    if (err) {
+      return sad(err);
+    }
+    return happy(dataset);
+  });
+}
+
+function finalizeDataset(datasetId, callback) {
+  const happy = () => callback();
+
+  const sad = (err) => {
+    api.log('platform finalize dataset failed:', err);
+    const error = buildError(err, datasetId);
+    callback(error);
+  };
+
+  api.log('finalize dataset for dataset id ', datasetId);
+
+  tidepool.finalizeDataset(datasetId, (err, result) => {
+    if (err) {
+      return sad(err, result);
+    }
+    return happy();
+  });
+}
+
+function addDataToDataset(data, datasetId, blockIndex, uploadType, callback) {
+  const recCount = data.length;
+  const happy = () => callback(null, recCount);
+
+  const sad = (error) => {
+    api.log('addDataToDataset: checking failure details');
+    if (error.status === 413 && data.length > 1) { // request entity too big
+      // but we can split the request and try again
+      const l = Math.floor(data.length / 2);
+      const d1 = data.slice(0, l);
+      const d2 = data.slice(l);
+      async.mapSeries([d1, d2], addDataToDataset, (err, result) => {
+        if (err) {
+          return callback(err, 0);
+        }
+        return callback(null, result[0] + result[1]);
+      });
+      return;
+    }
+    if (error.responseJSON && error.responseJSON.errorCode && error.responseJSON.errorCode === 'duplicate') {
+      api.log(error.responseJSON);
+      callback('duplicate', error.responseJSON.index);
+    } else {
+      api.log('platform add data to dataset failed.');
+      const err = buildError(error, datasetId);
+
+      if (error.errors && error.errors.length > 0) {
+        // eslint-disable-next-line no-restricted-syntax
+        for (const i in error.errors) {
+          if (error.errors[i].source) {
+            const hpattern = /\/(\d+)\//;
+            const toMatch = hpattern.exec(error.errors[i].source.pointer);
+            if (toMatch[1]) {
+              api.log('Offending record for error', i, ':', JSON.stringify(data[parseInt(toMatch[1], 10)], null, '\t'));
+            }
+          }
+        }
+      }
+
+      callback(err);
+    }
+  };
+
+  api.log(`addDataToDataset #${blockIndex}: using id ${datasetId}`);
+
+  const uploadForUser = getUploadFunction(uploadType);
+  uploadForUser(datasetId, data, (err, result) => {
+    if (err) {
+      return sad(err);
+    }
+    return happy(result);
+  });
+}
+
+/*
+ * process the data sending it to the platform in blocks and feed back
+ * progress to the calling function
+ * uploadType is the final argument (instead of the callback) so that existing calls to
+ * api.upload.toPlatform don't have to be modified in every driver, and will default to
+ * the jellyfish api
+ */
+api.upload.toPlatform = (data, sessionInfo, progress, groupId, cb, uploadType = 'jellyfish', devices) => {
+  // uploadType can either be 'jellyfish' or 'dataservices'
+
+  api.log(`attempting to upload ${data.length} device data records to ${uploadType} api`);
+  const grouped = _.groupBy(data, 'type');
+  // eslint-disable-next-line no-restricted-syntax
+  for (const type in grouped) {
+    if ({}.hasOwnProperty.call(grouped, type)) {
+      api.log(grouped[type].length, 'records of type', type);
+    }
+  }
+
+  const blocks = [];
+  const BLOCKSIZE = 1000;
+  let nblocks = 0;
+  let datasetId;
+  /* eslint-disable camelcase */
+  /* eslint-disable no-shadow */
+  const post_and_progress = (data, callback) => {
+    if (devices) {
+      // multiple devices being uploaded
+      const percentage = (((((nblocks += 1) / blocks.length) + devices.index - 1) / devices.total) * 100.0);
+      api.log(`Progress: ${devices.index} / ${devices.total} - ${percentage}%`);
+      progress(percentage);
+    } else {
+      progress(((nblocks += 1) / blocks.length) * 100.0);
+    }
+
+    // off to the platfrom we go
+    if (uploadType === 'jellyfish') {
+      return addDataToDataset(data, groupId, nblocks, uploadType, callback);
+    }
+    return addDataToDataset(data, datasetId, nblocks, uploadType, callback);
+  };
+
+  const post_dataset_create = (uploadMeta, callback) => createDatasetForUser(
+    groupId, uploadMeta, callback,
+  );
+
+  const post_dataset_finalize = (callback) => finalizeDataset(datasetId, callback);
+
+  const decorate = (data, uploadItem) => {
+    if (uploadType === 'jellyfish') {
+      const deviceRecords = _.map(data, (item) => _.extend({}, item, {
+        uploadId: uploadItem.uploadId,
+        guid: uuidv4(),
+      }));
+      return deviceRecords;
+    }
+    return data;
+  };
+
+  async.waterfall([
+    (callback) => {
+      // generate digest
+      const encoder = new TextEncoder();
+      const data = encoder.encode(`${sessionInfo.deviceId}_${sessionInfo.start}`);
+      crypto.subtle.digest('SHA-256', data).then((digest) => {
+        const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
+        return hex;
+      }).then((hexDigest) => {
+        callback(null, hexDigest);
+      });
+    },
+    (digest, callback) => {
+      // generate and post the upload metadata
+      const now = new Date();
+
+      if (rollbar) {
+        const nowHammerTime = now.getTime();
+        const events = _.filter(data, (event) => {
+          const year = parseInt(event.time.substring(0, 4), 10);
+          const timestamp = sundial.parseFromFormat(event.time).getTime();
+
+          return year < 2006 || timestamp > (nowHammerTime + (24 * 60 * sundial.MIN_TO_MSEC));
+        });
+
+        if (events.length > 0) {
+          rollbar.info('Upload contains event(s) prior to 2006 or more than a day in the future', events);
+        }
+      }
+
+      let uploadItem = builder().makeUpload()
+        // yes, I'm intentionally breaking up the new Date() I made and parsing
+        // it again with another new Date()...it's a moment limitation...
+        .with_computerTime(sundial.formatDeviceTime(new Date(Date.UTC(
+          now.getFullYear(), now.getMonth(), now.getDate(),
+          now.getHours(), now.getMinutes(), now.getSeconds(),
+        ))))
+        .with_time(sessionInfo.start)
+        .with_timezone(sessionInfo.tzName)
+        .with_timezoneOffset(-new Date().getTimezoneOffset())
+        .with_conversionOffset(0)
+        .with_timeProcessing(sessionInfo.timeProcessing)
+        .with_version(sessionInfo.version)
+        .with_deviceTags(sessionInfo.deviceTags)
+        .with_deviceTime(sessionInfo.deviceTime)
+        .with_deviceManufacturers(sessionInfo.deviceManufacturers)
+        .with_deviceModel(sessionInfo.deviceModel)
+        .with_deviceSerialNumber(sessionInfo.deviceSerialNumber)
+        .with_deviceId(sessionInfo.deviceId)
+        .with_payload(sessionInfo.payload)
+        .with_client({
+          name: 'org.tidepool.uploader',
+          version: sessionInfo.version,
+        });
+
+      if (sessionInfo.delta != null) {
+        _.set(uploadItem, 'client.private.delta', sessionInfo.delta);
+      }
+
+      if (sessionInfo.blobId != null) {
+        _.set(uploadItem, 'client.private.blobId', sessionInfo.blobId);
+      }
+
+      if (sessionInfo.annotations != null) {
+        _.set(uploadItem, 'annotations', sessionInfo.annotations);
+      }
+
+      if (sessionInfo.source != null) {
+        _.set(uploadItem, 'client.private.source', sessionInfo.source);
+      }
+
+      _.set(uploadItem, 'client.private.os', `${os.platform()}-${os.arch()}-${os.release()}`);
+
+      if (uploadType === 'jellyfish') {
+        uploadItem.with_uploadId(`upid_${digest.slice(0, 12)}`);
+        uploadItem.with_guid(uuidv4());
+        uploadItem.with_byUser(tidepool.getUserId());
+      }
+      uploadItem = uploadItem.done();
+      api.log('create dataset');
+
+      if (uploadType === 'dataservices') {
+        post_dataset_create(uploadItem, (err, dataset) => {
+          if (_.isEmpty(err)) {
+            api.log('created dataset');
+            datasetId = _.get(dataset, 'data.uploadId');
+            if (_.isEmpty(datasetId)) {
+              api.log('created dataset does not include uploadId');
+              return callback(new Error(format('Dataset response does not contain uploadId.')));
+            }
+            return callback(null, uploadItem);
+          }
+          api.log('error creating dataset ', err);
+          return callback(err);
+        });
+      } else {
+        // upload metadata uploaded as usual through jellyfish
+        addDataToDataset(uploadItem, groupId, 0, uploadType, (err) => {
+          if (_.isEmpty(err)) {
+            api.log('saved upload metadata');
+            return callback(null, uploadItem);
+          }
+          api.log('error saving upload metadata ', err);
+          return callback(err);
+        });
+      }
+    },
+    (uploadItem, callback) => {
+      // decorate our data with the successfully posted upload metadata
+      // as well as a GUID and then save to the platform
+      // eslint-disable-next-line no-param-reassign
+      data = decorate(data, uploadItem);
+
+      for (let i = 0; i < data.length; i += BLOCKSIZE) {
+        blocks.push(data.slice(i, i + BLOCKSIZE));
+      }
+      api.log('start uploading the rest of the data');
+      // process then finalise, or if you want you can finalize :)
+      async.mapSeries(blocks, post_and_progress, callback);
+    },
+    (result, callback) => {
+      if (uploadType === 'jellyfish') {
+        callback(null, result);
+      } else {
+        api.log('finalize dataset');
+        post_dataset_finalize((err) => {
+          if (_.isEmpty(err)) {
+            api.log('finalized dataset');
+            return callback(null, result);
+          }
+          api.log('error finalizing dataset', err);
+          return callback(err);
+        });
+      }
+    },
+  ], (err, result) => {
+    if (err == null) {
+      api.log('upload.toPlatform: all good');
+      if (env.browser && rollbar) {
+        rollbar.info('Successful Uploader-in-Web upload', sessionInfo);
+      }
+      return cb(null, result);
+    }
+    api.log('upload.toPlatform: failed ', err);
+    return cb(err);
+  });
+};
+
+api.getMostRecentUploadRecord = (userId, deviceId, cb) => {
+  api.log(`GET /data_sets?deviceId=${deviceId}&size=1`);
+  tidepool.getUploadRecordsForDevice(userId, deviceId, 1, (err, resp) => {
+    if (err) {
+      if (!navigator.onLine) {
+        const error = new Error(ErrorMessages.E_OFFLINE);
+        error.originalError = err;
+        return cb(error);
+      }
+      return cb(err);
+    }
+    api.log('Upload record response:', resp);
+    if (resp && resp.length > 0) {
+      return cb(null, resp[0]);
+    }
+
+    // could not retrieve an upload record, so return null
+    return cb(null, null);
+  });
+};
+
+api.upload.blob = async (blob, contentType, cb) => {
+  api.log('POST /blobs');
+  const blobObject = new Blob([blob], { type: contentType });
+
+  tidepool.uploadBlobForUser(tidepool.getUserId(), blobObject, contentType, null, (err, result) => {
+    if (err) {
+      return cb(err, null);
+    }
+    return cb(null, result);
+  });
+};
+
+// ----- Metrics -----
+
+api.metrics = {};
+
+api.metrics.track = (eventName, properties) => {
+  api.log(`GET /metrics/${window.encodeURIComponent(eventName)}`);
+  return tidepool.trackMetric(eventName, properties);
+};
+
+// ----- Server time -----
+api.getTime = (cb) => {
+  api.log('GET /time');
+  tidepool.getTime((err, resp) => {
+    if (err) {
+      if (!navigator.onLine) {
+        const error = new Error(ErrorMessages.E_OFFLINE);
+        error.originalError = err;
+        return cb(error);
+      }
+      return cb(err);
+    }
+    if (resp.data && resp.data.time) {
+      return cb(null, resp.data.time);
+    }
+    // the response is not in the right format,
+    // so we send nothing back
+    return cb(null, null);
+  });
+};
+
+// ----- Clinics -----
+
+api.clinics = {};
+
+api.clinics.getPatientsForClinic = (clinicId, options, cb) => tidepool.getPatientsForClinic(clinicId, options, cb);
+
+api.clinics.createClinicCustodialAccount = (clinicId, patient, cb) => tidepool.createClinicCustodialAccount(clinicId, patient, cb);
+
+api.clinics.updateClinicPatient = (clinicId, patientId, patient, cb) => tidepool.updateClinicPatient(clinicId, patientId, patient, cb);
+
+api.clinics.getClinicsForClinician = (clinicianId, options, cb) => tidepool.getClinicsForClinician(clinicianId, options, cb);
+
+api.clinics.getMRNSettings = (clinicId, cb) => tidepool.getClinicMRNSettings(clinicId, cb);
+
+api.clinics.getEHRSettings = (clinicId, cb) => tidepool.getClinicEHRSettings(clinicId, cb);
+
+api.clinics.getClinicPatientCount = (clinicId, cb) => tidepool.getClinicPatientCount(clinicId, cb);
+
+api.clinics.getClinicPatientCountSettings = (clinicId, cb) => tidepool.getClinicPatientCountSettings(clinicId, cb);
+
+// ----- Errors -----
+
+api.errors = {};
+
+api.errors.log = (error, message, properties) => {
+  api.log('GET /errors');
+  if (_.isError(error.originalError)) {
+    // eslint-disable-next-line no-param-reassign
+    error = error.originalError;
+  }
+  return tidepool.logAppError(error.debug, message, properties);
+};
+
+module.exports = api;
